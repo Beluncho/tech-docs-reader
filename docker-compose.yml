@@ -1,0 +1,58 @@
+name: tech-docs-reader
+
+# Тестовый стенд «Техническая документация».
+# Запуск: docker compose up -d  →  http://localhost:8081
+# OCR-воркер поднимается отдельно: docker compose --profile ocr up -d
+# Ключи LLM берутся из .env (переменные подставляются автоматически).
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    environment:
+      DATA_DIR: /srv/data
+      PRESETS_DIR: /srv/data/presets
+      BUNDLED_PRESETS_DIR: /srv/backend/app/presets
+      OCR_SERVICE_URL: ${OCR_SERVICE_URL:-http://ocr:8300}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      YANDEXGPT_API_KEY: ${YANDEXGPT_API_KEY:-}
+      YANDEXGPT_FOLDER_ID: ${YANDEXGPT_FOLDER_ID:-}
+      YANDEXGPT_API_BASE_URL: ${YANDEXGPT_API_BASE_URL:-https://ai.api.cloud.yandex.net/v1}
+      YANDEXGPT_RULE_MODEL: ${YANDEXGPT_RULE_MODEL:-qwen3-235b-a22b-fp8/latest}
+      YANDEXGPT_RULE_MODELS: ${YANDEXGPT_RULE_MODELS:-qwen3-235b-a22b-fp8/latest,qwen3.6-35b-a3b/latest,deepseek-v4-flash/latest,yandexgpt-5.1/latest}
+      LLM_TIMEOUT_SEC: ${LLM_TIMEOUT_SEC:-120}
+      LLM_RETRIES: ${LLM_RETRIES:-2}
+      LLM_JSON_MODE: ${LLM_JSON_MODE:-0}
+    volumes:
+      - tech-docs-data:/srv/data
+    expose:
+      - "8000"
+    restart: unless-stopped
+    logging: &api-logging  # ротация логов (5.7): не растить бесконечный json-file
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    ports:
+      # 8081: 8080 может быть занят другим сервисом на том же хосте.
+      - "${UI_PORT:-8081}:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  ocr:
+    build:
+      context: ./ocr-worker
+    profiles: ["ocr"]
+    expose:
+      - "8300"
+    restart: unless-stopped
+    logging: *api-logging  # та же ротация (5.7)
+
+volumes:
+  tech-docs-data:

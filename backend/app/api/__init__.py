@@ -1,0 +1,1 @@
+"""API-слой Tech Docs Reader."""

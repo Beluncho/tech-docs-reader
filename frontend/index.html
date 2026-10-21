@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Техническая документация</title>
+<link rel="stylesheet" href="style.css"/>
+<link rel="stylesheet" href="css/visual-mapper.css"/>
+</head>
+<body>
+<div id="fatal" hidden></div>
+<header>
+  <h1>Техническая документация</h1>
+  <div class="hint" id="api-hint">API: …</div>
+  <div class="hint" id="llm-hint">LLM: …</div>
+</header>
+
+<main>
+  <aside id="sidebar">
+    <div id="dropzone" title="Кликните, чтобы выбрать файл (или перетащите его сюда)">
+      <strong>Загрузить документ</strong>
+      <p>Кликните или перетащите PDF, XLSX, DOCX, CSV, TXT</p>
+      <div id="dropzone-status" hidden></div>
+      <input type="file" id="file-input" multiple tabindex="-1"/>
+      <label id="ocr-label"><input type="checkbox" id="ocr-check"/> распознать сканы (OCR)</label>
+    </div>
+    <div id="doc-list"><div class="empty-note">Документов пока нет — загрузите первый.</div></div>
+  </aside>
+
+  <section id="workspace">
+    <div id="empty">
+      <p><strong>Добро пожаловать</strong></p>
+      <p>Загрузите паспорт/сертификат/ТЗ — слева появится список, справа — результат извлечения.</p>
+      <button id="btn-empty-upload" class="primary">Выбрать файл…</button>
+    </div>
+
+    <div id="doc-view" hidden>
+      <div id="doc-head">
+        <h2 id="doc-title"></h2>
+        <div id="doc-meta"></div>
+        <div class="toolbar">
+          <select id="preset-select"></select>
+          <button id="btn-extract" class="primary">Извлечь</button>
+          <button id="btn-llm">Извлечь через LLM</button>
+          <button id="btn-constructor">Настроить набор</button>
+          <button id="btn-mapper">🎨 Визуальный маппинг</button>
+          <button id="btn-save-rule" hidden>Сохранить правило из результата</button>
+        </div>
+      </div>
+      <div id="warnings"></div>
+      <nav id="tabs">
+        <button class="tab active" data-tab="preview">Документ</button>
+        <button class="tab" data-tab="params">Параметры</button>
+      </nav>
+      <div id="tab-preview" class="tab-body active"></div>
+      <div id="tab-params" class="tab-body"></div>
+    </div>
+  </section>
+</main>
+
+<div id="mapper-backdrop" hidden>
+  <div id="mapper-modal">
+    <div id="mapper-head">
+      <h3>🎨 Визуальный маппинг таблицы</h3>
+      <select id="mapper-table-select" title="Таблица документа для маппинга (самая большая — по умолчанию)"></select>
+      <div class="mapper-zoom">
+        <button id="mapper-zoom-out" title="Уменьшить">−</button>
+        <button id="mapper-zoom-reset" title="Сбросить">100%</button>
+        <button id="mapper-zoom-in" title="Увеличить">+</button>
+      </div>
+      <button id="mapper-close" title="Закрыть маппер (Esc)">Закрыть</button>
+    </div>
+    <div id="mapper-body">
+      <div id="mapper-canvas-wrap" title="Клик — ячейка · протяните — диапазон · Ctrl+клик — добавить · Shift+клик — расширить · Ctrl+колесо — зум"><canvas id="mapper-canvas"></canvas></div>
+      <aside id="mapper-side">
+        <h4>Выделение</h4>
+        <div id="mapper-selection" class="mapper-cell-info">Кликните по ячейке или протяните диапазон</div>
+        <h4>Роли</h4>
+        <div id="mapper-roles" class="mapper-roles"></div>
+        <div class="role-params">
+          <input type="text" id="role-param-label" placeholder="Название параметра (для роли «Параметр»)"/>
+          <input type="text" id="role-param-unit" placeholder="Единица (м3/ч, кВт, мм…)"/>
+          <input type="text" id="role-param-group" placeholder="Группа (Гидравлика, Электрика…)"/>
+        </div>
+        <button id="mapper-remove-role" title="Снять роль с выделенных ячеек (аннотации останутся в истории — ↶ вернёт)">Снять роль с выделения</button>
+        <h4>🤖 LLM-ассистент</h4>
+        <button id="mapper-llm-suggest" title="LLM размечает роли по структуре таблицы — результат заменит текущие роли (↶ вернёт)">🤖 Предложить маппинг</button>
+        <div class="mapper-llm-hint">LLM размечает роли (~10 сек, ~2₽) — результат можно править и откатить (Ctrl+Z)</div>
+        <div id="mapper-llm-out" class="mapper-llm-out" hidden></div>
+        <h4>Операции</h4>
+        <div class="mapper-ops">
+          <button id="mapper-merge" title="Объединить выделенные ячейки в одну (прямоугольник)">⬜ Объединить</button>
+          <button id="mapper-split" title="Разделить объединённые ячейки в выделении">🔲 Разделить</button>
+          <button id="mapper-transpose" title="Поменять строки и столбцы местами">🔄 Транспонировать</button>
+          <button id="mapper-del-rows" title="Удалить строки выделения">− Строки</button>
+          <button id="mapper-del-cols" title="Удалить столбцы выделения">− Столбцы</button>
+        </div>
+        <h4>Предпросмотр</h4>
+        <button id="mapper-preview" title="Показать, что будет извлечено по текущим ролям (до сохранения шаблона)">👁️ Собрать предпросмотр</button>
+        <div id="mapper-preview-out" class="mapper-preview">
+          <div id="mapper-preview-stats"></div>
+          <div id="mapper-preview-warnings"></div>
+          <div id="mapper-preview-cards"></div>
+          <div class="mapper-preview-export">
+            <button id="mapper-export-json" title="Скачать маппинг и результат">⬇ JSON</button>
+            <button id="mapper-export-csv" title="Скачать результат таблицей">⬇ CSV</button>
+          </div>
+        </div>
+        <h4>Шаблон</h4>
+        <div id="mapper-template-match" class="mapper-tpl-match" hidden></div>
+        <div class="mapper-tpl-save">
+          <input type="text" id="mapper-tpl-name" placeholder="Имя шаблона"/>
+          <button id="mapper-tpl-save" title="Сохранить роли и структурные правки как шаблон (Ctrl+S)">💾 Сохранить шаблон</button>
+        </div>
+        <div id="mapper-tpl-list" class="mapper-tpl-list"></div>
+        <h4>Ячейка</h4>
+        <div id="mapper-cell-info" class="mapper-cell-info">Кликните по ячейке</div>
+        <h4>Структура таблицы</h4>
+        <div id="mapper-table-info"></div>
+        <h4>Легенда</h4>
+        <div id="mapper-legend" class="mapper-legend"></div>
+      </aside>
+    </div>
+    <div id="mapper-footer">
+      <span id="mapper-status" style="flex:1;align-self:center;font-size:12px;color:#667"></span>
+      <button id="mapper-undo" title="Ctrl+Z">↶ Отменить</button>
+      <button id="mapper-redo" title="Ctrl+Y / Ctrl+Shift+Z">↷ Повторить</button>
+      <button id="mapper-clear-annotations" title="Убрать все роли (одно действие истории — ↶ вернёт)">Очистить роли</button>
+    </div>
+  </div>
+</div>
+
+<div id="modal-backdrop" hidden>
+  <div id="modal">
+    <h3>Настроить набор</h3>
+    <div id="modal-body"></div>
+    <div class="modal-actions">
+      <button id="btn-preset-save" class="primary">Сохранить набор</button>
+      <button id="btn-modal-close">Закрыть</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

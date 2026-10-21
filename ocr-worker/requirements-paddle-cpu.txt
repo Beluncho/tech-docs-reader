@@ -1,0 +1,2 @@
+# Install this file only from PaddlePaddle's official stable CPU package index.
+paddlepaddle==3.2.2

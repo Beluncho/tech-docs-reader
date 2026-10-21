@@ -1,0 +1,12 @@
+# Локальные данные и артефакты (не для архива)
+data/
+*.log
+.env
+__pycache__/
+*.pyc
+.venv/
+# Отладочные визуализации детекции (подэтап 2.8)
+out-debug/
+.pytest_cache/
+backend/data/
+*.zip

@@ -1,0 +1,13 @@
+{
+  "id": "generic_2col_all",
+  "name": "Всё как пары «метка → значение»",
+  "description": "Универсальный набор для быстрого просмотра: любые двухколоночные пары без словаря меток.",
+  "doc_type": "generic",
+  "columns": {"count": 2, "has_header": false, "roles": {"label": 0, "value": 1}},
+  "labels": [],
+  "section_keywords": [],
+  "header_keywords": [],
+  "units": ["м3/ч", "м3/с", "л/с", "квт", "л.с.", "об/мин", "м", "мм", "кг", "т", "°с", "%", "в", "а", "гц", "мпа", "кпа", "бар", "кгс/см2", "па", "шт"],
+  "include_all": true,
+  "keyvalue": false
+}

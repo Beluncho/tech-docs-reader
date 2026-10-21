@@ -1,0 +1,9 @@
+# Classic OCR only; optional VL and document-processing extras are intentionally absent.
+fastapi==0.116.1
+numpy==1.26.4
+Pillow==11.3.0
+paddleocr==3.7.0
+paddlex==3.7.2
+pypdfium2==4.30.0
+python-multipart==0.0.20
+uvicorn==0.35.0
