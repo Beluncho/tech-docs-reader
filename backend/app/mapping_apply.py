@@ -12,10 +12,113 @@
 """
 from __future__ import annotations
 
+from app.normalize import normalize_header
 from app.preset import Cell, Table
 
 # Роли ячеек (roles.js): всё, кроме этих id, — неизвестные
 KNOWN_ROLES = {"model", "param", "value", "unit", "section", "condition", "ignore"}
+
+
+# --- многостраничная логическая таблица ------------------------------------
+
+
+def _row_signature(row: list[Cell]) -> list[str]:
+    return [normalize_header(cell.text or "") for cell in row]
+
+
+def repeated_header_rows(primary: Table, fragment: Table) -> int:
+    """Сколько первых строк ``fragment`` повторяют шапку ``primary``.
+
+    Строки сравниваются по колонкам после ``normalize_header``. Пустая строка
+    повтором не считается; сравнение обрывается на первом несовпадении. Если у
+    основной таблицы шапки нет, повторять нечего — 0.
+    """
+    count = 0
+    for i in range(min(max(primary.header_rows, 0), len(primary.rows), len(fragment.rows))):
+        expected = _row_signature(primary.rows[i])
+        actual = _row_signature(fragment.rows[i])
+        if not any(expected) or actual != expected:
+            break
+        count += 1
+    return count
+
+
+def combine_continuation_tables(
+    table: Table,
+    continuations: list[Table],
+    *,
+    skip_header_rows: bool | list[bool] = True,
+) -> Table:
+    """Дополнить ``table`` строками фрагментов со следующих страниц.
+
+    Детектор PDF возвращает отдельную таблицу для каждой страницы. Для
+    маппинга эти фрагменты должны выглядеть как одна сетка: координаты строк
+    продолжений сдвигаются, ссылки merged-ячеек сохраняются, а повторная шапка
+    продолжения (строки, совпадающие с шапкой основной таблицы) не дублируется.
+    ``skip_header_rows`` — общий флаг или флаг на каждый фрагмент; при False
+    строки фрагмента берутся целиком.
+    """
+    if isinstance(skip_header_rows, bool):
+        skip_flags = [skip_header_rows] * len(continuations)
+    else:
+        skip_flags = list(skip_header_rows) + [True] * (len(continuations) - len(skip_header_rows))
+    # шапка основной таблицы до добавления строк продолжений
+    primary_header = Table(
+        id=table.id,
+        rows=list(table.rows[: max(table.header_rows, 0)]),
+        header_rows=table.header_rows,
+    )
+
+    for continuation, skip_flag in zip(continuations, skip_flags):
+        if continuation.n_cols != table.n_cols:
+            raise ValueError(
+                f"число колонок продолжения {continuation.id} "
+                f"({continuation.n_cols}) не совпадает с основной таблицей ({table.n_cols})"
+            )
+
+        skipped = repeated_header_rows(primary_header, continuation) if skip_flag else 0
+        row_offset = len(table.rows)
+        appended: list[list[Cell]] = []
+
+        for source_row in continuation.rows[skipped:]:
+            target_row: list[Cell] = []
+            for cell in source_row:
+                new_row = row_offset + cell.row - skipped
+                merged_with = None
+                is_merged = cell.is_merged
+                if cell.merged_with is not None:
+                    anchor_row, anchor_col = cell.merged_with
+                    if anchor_row >= skipped:
+                        merged_with = (row_offset + anchor_row - skipped, anchor_col)
+                    else:
+                        # Якорь был в отброшенной повторной шапке: не оставляем
+                        # битую ссылку из тела таблицы.
+                        is_merged = False
+                target_row.append(
+                    Cell(
+                        text=cell.text,
+                        row=new_row,
+                        col=cell.col,
+                        page=cell.page if cell.page is not None else continuation.page,
+                        x0=cell.x0,
+                        y0=cell.y0,
+                        x1=cell.x1,
+                        y1=cell.y1,
+                        rowspan=cell.rowspan,
+                        colspan=cell.colspan,
+                        is_merged=is_merged,
+                        merged_with=merged_with,
+                    )
+                )
+            appended.append(target_row)
+
+        table.rows.extend(appended)
+        table.has_merged_cells = table.has_merged_cells or continuation.has_merged_cells
+
+    table.grid_rows = len(table.rows)
+    table.grid_cols = table.n_cols
+    return table
+
 
 # --- нормализация rows ↔ блоки (table-ops.js: toBlocks/fromBlocks) ------------
 

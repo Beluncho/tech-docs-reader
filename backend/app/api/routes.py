@@ -15,7 +15,13 @@ from app.api.deps import settings, storage
 from app.extract import extract_deterministic
 from app.llm import LLMError, extract_with_llm
 from app.loaders import load_document_cached
-from app.mapping_apply import apply_ops, build_preview, normalize_annotations
+from app.mapping_apply import (
+    apply_ops,
+    build_preview,
+    combine_continuation_tables,
+    repeated_header_rows,
+    normalize_annotations,
+)
 from app.mapping_template import (
     match_templates,
     table_signature,
@@ -505,6 +511,129 @@ def _table_from_meta(meta: dict, table_id: str) -> Table | None:
     return None
 
 
+def _tables_from_meta(meta: dict) -> list[Table]:
+    return [Table.from_dict(d) for d in meta.get("tables", [])]
+
+
+def _selected_continuations(
+    meta: dict,
+    table: Table,
+    table_ids: list[str],
+) -> tuple[list[Table], list[dict]]:
+    """Проверить выбранные фрагменты и построить переносимые ссылки шаблона."""
+    if not table_ids:
+        return [], []
+    if table.page is None:
+        raise HTTPException(422, "CONTINUATION_REQUIRES_PAGED_DOCUMENT")
+
+    all_tables = _tables_from_meta(meta)
+    by_id = {t.id: t for t in all_tables}
+    selected: list[Table] = []
+    seen: set[str] = set()
+    for table_id in table_ids:
+        if table_id in seen:
+            continue
+        seen.add(table_id)
+        continuation = by_id.get(table_id)
+        if continuation is None:
+            raise HTTPException(404, f"CONTINUATION_TABLE_NOT_FOUND: {table_id}")
+        if continuation.id == table.id or continuation.page is None or continuation.page <= table.page:
+            raise HTTPException(422, f"CONTINUATION_MUST_BE_ON_LATER_PAGE: {table_id}")
+        if continuation.n_cols != table.n_cols:
+            raise HTTPException(
+                422,
+                f"CONTINUATION_COLUMNS_MISMATCH: {table_id} "
+                f"({continuation.n_cols} != {table.n_cols})",
+            )
+        selected.append(continuation)
+
+    order = {t.id: i for i, t in enumerate(all_tables)}
+    selected.sort(key=lambda t: (t.page if t.page is not None else -1, order[t.id]))
+    refs = []
+    for continuation in selected:
+        page_tables = [t for t in all_tables if t.page == continuation.page]
+        refs.append(
+            {
+                "page_offset": continuation.page - table.page,
+                "table_index": next(i for i, t in enumerate(page_tables, 1) if t.id == continuation.id),
+                "n_cols": continuation.n_cols,
+                "skip_header_rows": True,
+                "repeats_header": repeated_header_rows(table, continuation) > 0,
+            }
+        )
+    return selected, refs
+
+
+def _continuation_confirmed(
+    table: Table,
+    previous: Table,
+    candidate: Table,
+    ref: dict,
+    page_tables: list[Table],
+    all_tables: list[Table],
+) -> bool:
+    """Есть ли доказательства, что ``candidate`` продолжает ``table``.
+
+    С повторной шапкой — шапка кандидата совпадает с шапкой основной таблицы.
+    Без неё — у кандидата нет своей (другой) шапки, он первый на странице,
+    а предыдущая часть логической таблицы — последняя на своей странице.
+    """
+    if candidate.n_cols != table.n_cols or candidate.id == table.id:
+        return False
+    if repeated_header_rows(table, candidate) > 0:
+        return True  # повторённая шапка основной таблицы — сильное доказательство
+    if ref.get("repeats_header"):
+        return False  # шаблон ждёт повтор шапки, а его нет
+    if candidate.header_rows > 0:
+        return False  # собственная, другая шапка — это отдельная таблица
+    prev_page_tables = [t for t in all_tables if t.page == previous.page]
+    return (
+        page_tables[0].id == candidate.id
+        and prev_page_tables[-1].id == previous.id
+    )
+
+
+def _resolve_template_continuations(
+    meta: dict, table: Table, template: dict
+) -> tuple[list[tuple[Table, dict]], list[str]]:
+    """Найти продолжения шаблона относительно страницы целевой таблицы.
+
+    Возвращает подтверждённые пары (фрагмент, ссылка) и предупреждения о
+    пропущенных ссылках. ``table_index`` считается по всем таблицам страницы.
+    """
+    refs = template.get("continuations") or []
+    if not refs or table.page is None:
+        return [], []
+    all_tables = _tables_from_meta(meta)
+    resolved: list[tuple[Table, dict]] = []
+    warnings: list[str] = []
+    used: set[str] = set()
+    previous = table
+    for ref in refs:
+        page_offset = int(ref.get("page_offset", 0))
+        if page_offset <= 0:
+            continue
+        page_tables = [t for t in all_tables if t.page == table.page + page_offset]
+        index = int(ref.get("table_index") or 0)
+        by_index = page_tables[index - 1] if 1 <= index <= len(page_tables) else None
+        ordered = ([by_index] if by_index else []) + [t for t in page_tables if t is not by_index]
+        candidate = next(
+            (
+                t for t in ordered
+                if t.id not in used
+                and _continuation_confirmed(table, previous, t, ref, page_tables, all_tables)
+            ),
+            None,
+        )
+        if candidate is None:
+            warnings.append(f"Продолжение на стр. +{page_offset} не подтверждено — пропущено")
+            continue
+        resolved.append((candidate, ref))
+        used.add(candidate.id)
+        previous = candidate
+    return resolved, warnings
+
+
 @router.post("/presets/save-from-mapping", response_model=MappingTemplateOut)
 def save_mapping(body: MappingCreate):
     """Сохранить маппинг из Visual Mapper (роли + структурные правки) как шаблон."""
@@ -516,6 +645,9 @@ def save_mapping(body: MappingCreate):
         raise HTTPException(404, "TABLE_NOT_FOUND")
     if not body.annotations:
         raise HTTPException(422, "EMPTY_MAPPING — назначьте роли перед сохранением")
+    continuations, continuation_refs = _selected_continuations(
+        meta, table, body.continuation_table_ids
+    )
 
     template = template_from_mapping(
         name=body.name.strip() or f"Шаблон {body.table_id}",
@@ -526,9 +658,11 @@ def save_mapping(body: MappingCreate):
             "document_id": body.document_id,
             "table_id": body.table_id,
             "filename": meta.get("filename", ""),
+            "continuation_table_ids": [t.id for t in continuations],
         },
         ops=[op.model_dump(exclude_none=True) for op in body.ops],
         annotations=[a.model_dump(exclude_none=True) for a in body.annotations],
+        continuations=continuation_refs,
     )
     mapping_id = storage.save_mapping(template)
     return MappingTemplateOut(**storage.get_mapping(mapping_id))
@@ -613,6 +747,8 @@ def validate_mapping(body: MappingValidateRequest):
     if not body.annotations:
         raise HTTPException(422, "EMPTY_MAPPING — назначьте роли перед проверкой")
 
+    continuations, _refs = _selected_continuations(meta, table, body.continuation_table_ids)
+    combine_continuation_tables(table, continuations)
     apply_ops(table, [op.model_dump(exclude_none=True) for op in body.ops])
     anns = normalize_annotations(table, [a.model_dump(exclude_none=True) for a in body.annotations])
     preview = build_preview(table, anns)
@@ -644,6 +780,13 @@ def apply_mapping_template(body: MappingApplyRequest):
     if tpl is None:
         raise HTTPException(404, "MAPPING_NOT_FOUND")
 
+    resolved, warnings = _resolve_template_continuations(meta, table, tpl)
+    continuations = [t for t, _ref in resolved]
+    combine_continuation_tables(
+        table,
+        continuations,
+        skip_header_rows=[bool(ref.get("skip_header_rows", True)) for _t, ref in resolved],
+    )
     ops = tpl.get("ops") or []
     raw_anns = tpl.get("annotations") or []
     apply_ops(table, ops)
@@ -651,6 +794,8 @@ def apply_mapping_template(body: MappingApplyRequest):
     return MappingApplyOut(
         template_id=tpl["id"],
         table=_table_out(table),
+        continuation_table_ids=[t.id for t in continuations],
+        warnings=warnings,
         annotations=[MappingAnnotation(**a) for a in anns],
         skipped_annotations=len(raw_anns) - len(anns),
         applied_ops=len(ops),
@@ -676,6 +821,8 @@ def suggest_mapping(body: LLMSuggestRequest):
     if not settings.llm_enabled:
         raise HTTPException(503, "LLM_NOT_CONFIGURED")
 
+    continuations, _refs = _selected_continuations(meta, table, body.continuation_table_ids)
+    combine_continuation_tables(table, continuations)
     context = body.context.model_dump() if body.context else None
     t0 = time.perf_counter()
     try:

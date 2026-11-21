@@ -557,10 +557,172 @@ async function savePresetFromConstructor() {
 let mapper = null; // VisualMapper
 let mapperTableId = null; // id смонтированной таблицы (для шаблонов 3.7)
 let mapperBaseOps = []; // ops уже учтённые в смонтированной таблице (шаблон) — вне истории
+let mapperContinuationIds = []; // фрагменты логической таблицы на следующих страницах
+let mapperApplySeq = 0; // номер последнего применения шаблона / монтирования (защита от гонок)
 
 function mapperTables() {
   // для прототипа: любые таблицы с координатной сеткой (cells) подходят
   return (current && current.tables || []).filter((t) => t.cells && t.cells.length);
+}
+
+function mapperContinuationCandidates(tableId = mapperTableId) {
+  const tables = mapperTables();
+  const primary = tables.find((t) => t.id === tableId);
+  if (!primary || primary.page == null) return [];
+  return tables
+    .filter((t) => t.id !== primary.id && t.page != null && t.page > primary.page && t.n_cols === primary.n_cols)
+    .sort((a, b) => a.page - b.page || tables.indexOf(a) - tables.indexOf(b));
+}
+
+/** Порт normalize_text + normalize_header (backend/app/normalize.py). */
+function normalizeHeaderText(text) {
+  if (!text) return "";
+  let t = String(text).replace(/№/g, " ").normalize("NFKC");
+  t = t.replace(/\u00a0/g, " ").replace(/\u2011/g, "-").replace(/ё/g, "е").replace(/Ё/g, "Е");
+  t = t.replace(/\s+/g, " ").trim().toLowerCase();
+  return t.replace(/^[№\s.\-:;()[\]«»"']+|[№\s.\-:;()[\]«»"']+$/g, "");
+}
+
+/** Нормализованные тексты строки row таблицы TableOut (по колонкам). */
+function mapperRowSignature(table, row) {
+  const sig = new Array(table.n_cols || 0).fill("");
+  (table.cells || []).forEach((c) => {
+    if (c.row === row && c.col >= 0 && c.col < sig.length) sig[c.col] = normalizeHeaderText(c.text);
+  });
+  return sig;
+}
+
+/** Сколько первых строк part повторяют шапку primary (паритет repeated_header_rows). */
+function mapperRepeatedHeaderRows(primary, part) {
+  const limit = Math.min(Math.max(primary.header_rows || 0, 0), primary.n_rows || 0, part.n_rows || 0);
+  let count = 0;
+  for (let i = 0; i < limit; i++) {
+    const expected = mapperRowSignature(primary, i);
+    const actual = mapperRowSignature(part, i);
+    if (!expected.some(Boolean) || expected.join("\x1f") !== actual.join("\x1f")) break;
+    count += 1;
+  }
+  return count;
+}
+
+/** Склеить постраничные фрагменты в TableOut с единой нумерацией строк.
+ *  skipFlags[i] === false — фрагмент берётся целиком, иначе повторная шапка отбрасывается. */
+function buildMapperLogicalTable(primary, continuationIds = mapperContinuationIds, skipFlags = []) {
+  const out = VisualMapper.cloneTable(primary);
+  const tables = mapperTables();
+  const flagById = new Map(continuationIds.map((id, i) => [id, skipFlags[i] !== false]));
+  const selected = continuationIds
+    .map((id) => tables.find((t) => t.id === id))
+    .filter(Boolean)
+    .sort((a, b) => a.page - b.page || tables.indexOf(a) - tables.indexOf(b));
+
+  selected.forEach((part) => {
+    const skip = flagById.get(part.id) ? mapperRepeatedHeaderRows(primary, part) : 0;
+    const rowOffset = out.n_rows;
+    (part.cells || []).forEach((cell) => {
+      if (cell.row < skip) return;
+      const copy = { ...cell, row: rowOffset + cell.row - skip };
+      if (cell.merged_with) {
+        if (cell.merged_with[0] >= skip) {
+          copy.merged_with = [rowOffset + cell.merged_with[0] - skip, cell.merged_with[1]];
+        } else {
+          copy.is_merged = false;
+          copy.merged_with = null;
+        }
+      }
+      if (copy.page == null) copy.page = part.page;
+      out.cells.push(copy);
+    });
+    out.n_rows += Math.max(0, (part.n_rows || 0) - skip);
+    out.has_merged_cells = out.has_merged_cells || part.has_merged_cells;
+  });
+  out.continuation_table_ids = selected.map((t) => t.id);
+  return out;
+}
+
+/** Паритет _continuation_confirmed (routes.py): есть ли доказательства продолжения. */
+function mapperContinuationConfirmed(primary, previous, candidate, ref, pageTables, allTables) {
+  if (candidate.n_cols !== primary.n_cols || candidate.id === primary.id) return false;
+  if (mapperRepeatedHeaderRows(primary, candidate) > 0) return true;
+  if (ref.repeats_header) return false;
+  if ((candidate.header_rows || 0) > 0) return false;
+  const prevPage = allTables.filter((t) => t.page === previous.page);
+  return pageTables[0].id === candidate.id && prevPage[prevPage.length - 1].id === previous.id;
+}
+
+/** Разрешить относительные ссылки продолжений сохранённого шаблона локально
+ *  (паритет _resolve_template_continuations: table_index — по всем таблицам страницы). */
+function resolveMapperTemplateContinuations(primary, refs) {
+  const result = { ids: [], skipFlags: [], warnings: [] };
+  if (!primary || primary.page == null) return result;
+  const allTables = (current && current.tables) || [];
+  const usable = new Set(mapperTables().map((t) => t.id)); // склеить можно только таблицы с ячейками
+  let previous = primary;
+  (refs || []).forEach((ref) => {
+    if (!(ref.page_offset > 0)) return;
+    const pageTables = allTables.filter((t) => t.page === primary.page + ref.page_offset);
+    const byIndex = pageTables[(ref.table_index || 0) - 1];
+    const ordered = (byIndex ? [byIndex] : []).concat(pageTables.filter((t) => t !== byIndex));
+    const candidate = ordered.find((t) =>
+      usable.has(t.id) && !result.ids.includes(t.id) &&
+      mapperContinuationConfirmed(primary, previous, t, ref, pageTables, allTables));
+    if (!candidate) {
+      result.warnings.push(`Продолжение на стр. +${ref.page_offset} не подтверждено — пропущено`);
+      return;
+    }
+    result.ids.push(candidate.id);
+    result.skipFlags.push(ref.skip_header_rows !== false);
+    previous = candidate;
+  });
+  return result;
+}
+
+function renderMapperContinuations() {
+  const box = $("mapper-continuations");
+  if (!box) return;
+  const candidates = mapperContinuationCandidates();
+  box.innerHTML = "";
+  if (!candidates.length) {
+    box.innerHTML = '<div class="mc-empty">На следующих страницах нет таблиц с тем же числом столбцов.</div>';
+    return;
+  }
+  candidates.forEach((t) => {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = t.id;
+    input.checked = mapperContinuationIds.includes(t.id);
+    const text = document.createElement("span");
+    text.textContent = mapperTableOptionText(t);
+    input.onchange = () => {
+      const next = [...box.querySelectorAll('input[type="checkbox"]:checked')].map((el) => el.value);
+      const anns = mapper ? mapper.getAnnotations() : [];
+      const ops = mapperAllOps();
+      const removing = mapperContinuationIds.some((id) => !next.includes(id));
+      if (removing && anns.length && !window.confirm(
+        "Роли в отключаемом фрагменте будут удалены, остальная разметка сохранится.\nПродолжить?"
+      )) {
+        renderMapperContinuations();
+        return;
+      }
+      const primary = mapperTables().find((x) => x.id === mapperTableId);
+      if (!primary) return;
+      // Фрагменты добавляются/убираются ниже основной части, поэтому её координаты
+      // не меняются: пересобираем таблицу, повторяем правки и переносим роли.
+      mapperContinuationIds = next;
+      const logical = buildMapperLogicalTable(primary, next);
+      applyOps(logical, ops); // битые спеки (строки отключённого фрагмента) пропускаются
+      mountMapperTable(primary.id, logical, ops);
+      const kept = anns.length ? mapper.setAnnotations(anns) : 0;
+      const lost = anns.length - kept;
+      $("mapper-status").textContent =
+        (next.length ? `Продолжения: ${next.length}` : "Продолжения отключены") +
+        (anns.length ? ` · перенесено ролей ${kept}` : "") +
+        (lost > 0 ? `, пропущено ${lost}` : "");
+    };
+    label.append(input, text);
+    box.appendChild(label);
+  });
 }
 
 /** Текст опции селекта таблиц маппера: мета + маркер найденного шаблона (3.9). */
@@ -610,6 +772,7 @@ function openMapper() {
   buildMapperOps();
   ["role-param-label", "role-param-unit", "role-param-group"].forEach((id) => ($(id).value = ""));
   $("mapper-backdrop").hidden = false;
+  mapperContinuationIds = [];
   mountMapperTable(best.id);
 }
 
@@ -617,12 +780,13 @@ function mountMapperTable(tableId, edited, baseOps) {
   const t = mapperTables().find((x) => x.id === tableId);
   if (!t) return;
   mapperTableId = tableId;
+  mapperApplySeq++; // ответы применений, начатых до этого монтирования, устарели
   mapperBaseOps = baseOps || []; // правки шаблона: в таблице уже, но не в истории
   if (mapper) { mapper.destroy(); mapper = null; }
   // fabric пере-создаёт обёртку canvas при dispose; берём свежий элемент
   const wrap = $("mapper-canvas-wrap");
   wrap.innerHTML = '<canvas id="mapper-canvas"></canvas>';
-  mapper = new VisualMapper($("mapper-canvas"), edited || t, {
+  mapper = new VisualMapper($("mapper-canvas"), edited || buildMapperLogicalTable(t), {
     onCellClick: showMapperCellInfo,
     onSelectionChange: updateMapperSelection,
     onZoom: updateMapperZoomLabel,
@@ -639,6 +803,7 @@ function mountMapperTable(tableId, edited, baseOps) {
     $("mapper-status").textContent = "";
   }
   showMapperTableInfo(mapper.table);
+  renderMapperContinuations();
   checkMapperTemplateMatch();
   refreshMapperTemplates();
   resetMapperSuggest(); // панель LLM не должна переживать смену таблицы
@@ -660,8 +825,9 @@ function showMapperCellInfo(cell) {
     ? ` · span ${cell.rowspan}×${cell.colspan}` : "";
   const merged = cell.is_merged
     ? ` · продолжение (${cell.merged_with ? cell.merged_with.join(",") : "?"})` : "";
+  const page = cell.page != null ? ` · стр. ${cell.page + 1}` : "";
   info.innerHTML =
-    `<div class="mi-meta">r${cell.row}, c${cell.col}${span}${merged}</div>` +
+    `<div class="mi-meta">r${cell.row}, c${cell.col}${page}${span}${merged}</div>` +
     `<div class="mi-text">«${escapeHtml(cell.text || "(пусто)")}»</div>`;
 }
 
@@ -683,9 +849,14 @@ function updateMapperSelection(sel) {
 }
 
 function showMapperTableInfo(t) {
+  const parts = [mapperTables().find((x) => x.id === mapperTableId), ...mapperContinuationIds.map(
+    (id) => mapperTables().find((x) => x.id === id)
+  )].filter(Boolean);
+  const pages = [...new Set(parts.map((p) => p.page).filter((p) => p != null))].map((p) => p + 1);
   const rows = [
     `Размер: ${t.n_rows}×${t.n_cols}`,
-    t.page != null ? `Страница: ${t.page + 1}` : null,
+    pages.length > 1 ? `Страницы: ${pages.join(", ")}` : (t.page != null ? `Страница: ${t.page + 1}` : null),
+    mapperContinuationIds.length ? `Фрагментов: ${mapperContinuationIds.length + 1}` : null,
     t.header_rows ? `Шапка: ${t.header_rows} стр.` : "Шапка: нет",
     t.has_merged_cells ? "Merged cells: есть" : "Merged cells: нет",
     t.is_matrix ? `Матрица: ${t.orientation === "rows" ? "модели в строках" : "модели в столбцах"}` : "Матрица: нет",
@@ -805,6 +976,7 @@ async function generateMapperPreview() {
         body: JSON.stringify({
           document_id: current.id,
           table_id: mapperTableId,
+          continuation_table_ids: mapperContinuationIds,
           ops: mapperAllOps(),
           annotations: anns,
         }),
@@ -871,6 +1043,7 @@ function exportMapperPreview(kind) {
       page: t.page,
       size: [t.n_rows, t.n_cols],
       header_rows: t.header_rows || 0,
+      continuation_table_ids: mapperContinuationIds,
       ops: mapperAllOps(), // структурные правки (рецепт для шаблона)
       annotations: mapper.getAnnotations(),
       preview: previewResult,
@@ -947,6 +1120,7 @@ async function suggestMapperMapping() {
   )) return;
 
   const tableId = mapperTableId;
+  const continuationKey = mapperContinuationIds.join("\x1f");
   const btn = $("mapper-llm-suggest");
   btn.disabled = true;
   $("mapper-status").textContent = "🤖 LLM анализирует таблицу…";
@@ -955,7 +1129,11 @@ async function suggestMapperMapping() {
     out = await api("/llm/suggest-mapping", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ document_id: current.id, table_id: tableId }),
+      body: JSON.stringify({
+        document_id: current.id,
+        table_id: tableId,
+        continuation_table_ids: mapperContinuationIds,
+      }),
     });
   } catch (err) {
     $("mapper-status").textContent = "LLM: " + friendlyError(err);
@@ -963,7 +1141,7 @@ async function suggestMapperMapping() {
   } finally {
     btn.disabled = false;
   }
-  if (!mapper || mapperTableId !== tableId) return; // таблицу сменили, пока шёл запрос
+  if (!mapper || mapperTableId !== tableId || mapperContinuationIds.join("\x1f") !== continuationKey) return;
 
   if (!out.annotations.length) {
     // пустой список — легитимный ответ (мусорная таблица), роли не трогаем
@@ -1146,7 +1324,10 @@ async function checkMapperTemplateMatch() {
 async function applyMapperTemplate(tpl) {
   const t = mapperTables().find((x) => x.id === mapperTableId);
   if (!t || !current) return;
+  const seq = ++mapperApplySeq;
   let edited;
+  let resolvedIds;
+  let warnings = [];
   let anns = tpl.annotations || [];
   try {
     const out = await api("/mapping/apply-template", {
@@ -1160,17 +1341,25 @@ async function applyMapperTemplate(tpl) {
     });
     edited = out.table;
     anns = out.annotations;
+    resolvedIds = out.continuation_table_ids || [];
+    warnings = out.warnings || [];
   } catch (_) {
-    edited = VisualMapper.cloneTable(t);
+    const local = resolveMapperTemplateContinuations(t, tpl.continuations || []);
+    resolvedIds = local.ids;
+    warnings = local.warnings;
+    edited = buildMapperLogicalTable(t, resolvedIds, local.skipFlags);
     applyOps(edited, tpl.ops || []);
   }
-  if (!mapper || mapperTableId !== t.id) return; // таблицу сменили, пока шли запросы
+  // таблицу сменили или запустили новое применение, пока шли запросы
+  if (!mapper || mapperTableId !== t.id || seq !== mapperApplySeq) return;
+  mapperContinuationIds = resolvedIds;
   mountMapperTable(t.id, edited, tpl.ops || []);
   const n = mapper.setAnnotations(anns);
   const skipped = (tpl.annotations || []).length - n;
   $("mapper-status").textContent =
     `Шаблон «${tpl.name}» применён: правок ${ (tpl.ops || []).length }, ролей ${n}` +
-    (skipped > 0 ? ` · пропущено ${skipped} (структура не совпала)` : "");
+    (skipped > 0 ? ` · пропущено ${skipped} (структура не совпала)` : "") +
+    (warnings.length ? ` · ${warnings.join("; ")}` : "");
   $("mapper-template-match").hidden = true;
 }
 
@@ -1194,6 +1383,7 @@ async function saveMapperTemplate() {
         description: `Из «${current.filename}», таблица ${mapperTableId} (${mapper.table.n_rows}×${mapper.table.n_cols})`,
         document_id: current.id,
         table_id: mapperTableId,
+        continuation_table_ids: mapperContinuationIds,
         ops: mapperAllOps(),
         annotations: anns,
       }),
@@ -1298,6 +1488,7 @@ document.addEventListener("DOMContentLoaded", () => {
       e.target.value = mapperTableId; // откат выбора, остаёмся на текущей
       return;
     }
+    mapperContinuationIds = [];
     mountMapperTable(e.target.value);
   };
   $("mapper-zoom-in").onclick = () => mapper && mapper.zoomIn();

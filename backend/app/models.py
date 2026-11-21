@@ -164,11 +164,26 @@ class MappingOp(BaseModel):
     cols: list[int] | None = None         # del_cols
 
 
+class MappingContinuationRef(BaseModel):
+    """Фрагмент логической таблицы на следующей странице.
+
+    Ссылка хранится относительно первой таблицы, поэтому шаблон можно
+    применить к документу, где та же таблица начинается на другой странице.
+    """
+
+    page_offset: int = Field(ge=1)
+    table_index: int = Field(ge=1)  # порядковый номер таблицы на целевой странице
+    n_cols: int = Field(ge=1)
+    skip_header_rows: bool = True  # отбрасывать строки, повторяющие шапку основной таблицы
+    repeats_header: bool | None = None  # фрагмент повторял шапку при сохранении (None — старый формат)
+
+
 class MappingCreate(BaseModel):
     name: str
     description: str = ""
     document_id: str
     table_id: str
+    continuation_table_ids: list[str] = Field(default_factory=list)
     ops: list[MappingOp] = Field(default_factory=list)
     annotations: list[MappingAnnotation]
 
@@ -181,6 +196,7 @@ class MappingTemplateOut(BaseModel):
     source: dict = Field(default_factory=dict)
     table_fingerprint: str | None = None
     table_signature: dict = Field(default_factory=dict)
+    continuations: list[MappingContinuationRef] = Field(default_factory=list)
     ops: list[MappingOp] = Field(default_factory=list)
     annotations: list[MappingAnnotation] = Field(default_factory=list)
 
@@ -211,6 +227,7 @@ class LLMSuggestContext(BaseModel):
 class LLMSuggestRequest(BaseModel):
     document_id: str
     table_id: str
+    continuation_table_ids: list[str] = Field(default_factory=list)
     context: LLMSuggestContext | None = None
     refresh: bool = False  # обойти кэш, принудительно сходить в LLM (4.7)
 
@@ -341,6 +358,7 @@ class MappingValidateRequest(BaseModel):
 
     document_id: str
     table_id: str
+    continuation_table_ids: list[str] = Field(default_factory=list)
     ops: list[MappingOp] = Field(default_factory=list)
     annotations: list[MappingAnnotation]
 
@@ -364,6 +382,8 @@ class MappingApplyOut(BaseModel):
 
     template_id: str
     table: TableOut
+    continuation_table_ids: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)  # пропущенные/неподтверждённые продолжения
     annotations: list[MappingAnnotation] = Field(default_factory=list)
     skipped_annotations: int = 0  # слоты не совпали со структурой / неизвестные роли
     applied_ops: int = 0

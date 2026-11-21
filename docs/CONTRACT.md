@@ -171,6 +171,27 @@
 Итоговую таблицу шаблон не хранит — у похожей таблицы другие тексты; рецепт
 координатных операций воспроизводит правки на идентичной структуре.
 
+Многостраничная таблица собирается из первой части и выбранных
+`continuation_table_ids`. В шаблоне они хранятся как `continuations[]`:
+`page_offset`, порядковый `table_index` среди **всех** таблиц страницы, `n_cols`,
+`skip_header_rows` (отбрасывать строки фрагмента, совпадающие с шапкой основной
+таблицы; по умолчанию `true`) и `repeats_header` (фрагмент повторял шапку при
+сохранении; `null` у старых шаблонов). Относительная ссылка позволяет применить
+шаблон к документу, где логическая таблица начинается на другой странице.
+
+Отбрасываются только первые строки фрагмента, которые после `normalize_header`
+по колонкам совпадают со строками шапки основной таблицы. Строки, лишь
+распознанные детектором как шапка (например, заголовок раздела), сохраняются.
+
+При применении шаблона кандидат сначала ищется по `table_index`, затем среди
+остальных таблиц страницы, и принимается только с доказательством продолжения:
+- его первые строки повторяют шапку основной таблицы, или
+- шаблон не ждёт повтора (`repeats_header` не `true`), у кандидата нет своей
+  шапки, он первый на своей странице, а предыдущая часть — последняя на своей.
+
+Неподтверждённая ссылка пропускается и попадает в `warnings` ответа
+`/api/mapping/apply-template`.
+
 Подбор: сигнатура таблицы `{cols, headers}` (нормализованные тексты шапки);
 матч — «exact» по sha256-фингерпринту или «partial» при равном `cols` и
 Jaccard шапки ≥ 0.75. Хранение: `data/mappings/*.json`, отдельно от наборов.
@@ -193,14 +214,14 @@ Jaccard шапки ≥ 0.75. Хранение: `data/mappings/*.json`, отде�
 | POST | `/api/documents/{id}/reprocess` | повторное извлечение |
 | GET/POST/PUT/DELETE | `/api/presets` | CRUD наборов |
 | POST | `/api/presets/from-extraction` | сохранить набор из успешного прогона (`document_id`, `name?`, `preset_id?`, `table_id?`) |
-| POST | `/api/presets/save-from-mapping` | сохранить шаблон из Visual Mapper (`name`, `document_id`, `table_id`, `ops`, `annotations`) |
+| POST | `/api/presets/save-from-mapping` | сохранить шаблон из Visual Mapper (`name`, `document_id`, `table_id`, `continuation_table_ids?`, `ops`, `annotations`) |
 | GET | `/api/mapping/templates` | список шаблонов маппинга |
 | DELETE | `/api/mapping/templates/{id}` | удалить шаблон |
 | GET | `/api/mapping/match` | лучший шаблон для таблицы (`document_id`, `table_id`) — полный или `null` |
 | GET | `/api/mapping/match-document` | лёгкие мачи всех таблиц документа одним запросом (id/имя/score/method, без ops/аннотаций) |
-| POST | `/api/mapping/validate` | предпросмотр извлечения по ops+ролям → `{cards, stats, warnings}` |
-| POST | `/api/mapping/apply-template` | применить шаблон к таблице → правленая таблица + нормализованные роли (+`skipped_annotations`) |
-| POST | `/api/llm/suggest-mapping` | предложить маппинг таблицы через LLM (аннотации с confidence, без автоприменения; `refresh?` — обойти кэш) |
+| POST | `/api/mapping/validate` | предпросмотр по `table_id` + `continuation_table_ids?` + ops/ролям → `{cards, stats, warnings}` |
+| POST | `/api/mapping/apply-template` | применить шаблон, включая продолжения → правленая таблица + `continuation_table_ids` + роли + `warnings` (пропущенные продолжения) |
+| POST | `/api/llm/suggest-mapping` | предложить маппинг таблицы и её `continuation_table_ids?` через LLM (аннотации с confidence; `refresh?` — обойти кэш) |
 | POST | `/api/llm/feedback` | записать коррекции пользователя «LLM предложил → выбрал» в журнал (тюнинг промптов) |
 | GET | `/api/llm/metrics` | метрики LLM-маппинга: запросы/кэш/токены/время + точность по журналу коррекций |
 | GET | `/api/health` | статус |

@@ -150,8 +150,9 @@ API обращается к нему по `OCR_SERVICE_URL` (в compose — `htt
 ## Тесты
 
 ```bash
+pip install -r backend/requirements-dev.txt   # зависимости API + pytest
 python -m pytest tests -q
-# 190 passed
+# 198 passed
 ```
 
 Публичная версия не содержит тестов и скриптов, которым нужен закрытый набор

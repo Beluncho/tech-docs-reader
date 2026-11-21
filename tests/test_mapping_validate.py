@@ -11,14 +11,17 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from app.api.deps import storage
 from app.main import app
 from app.mapping_apply import (
     apply_ops,
     build_preview,
+    combine_continuation_tables,
     delete_cols,
     delete_rows,
     merge_rect,
     normalize_annotations,
+    repeated_header_rows,
     split_blocks,
     transpose_table,
 )
@@ -58,6 +61,38 @@ def _block_table(blocks: list[tuple], n_rows: int, n_cols: int, **kw) -> Table:
 
 def _anchor(table: Table, r: int, c: int) -> Cell:
     return table.get_cell(r, c)
+
+
+def test_combine_continuation_tables_reindexes_rows_and_skips_repeated_header():
+    first = _grid(
+        ["Параметр", "Значение"],
+        ["Подача", "10"],
+        header_rows=1,
+        page=0,
+    )
+    first.id = "p1-t1"
+    continuation = _grid(
+        ["Параметр", "Значение"],
+        ["Напор", "20"],
+        header_rows=1,
+        page=1,
+    )
+    continuation.id = "p2-t1"
+    for row in continuation.rows:
+        for cell in row:
+            cell.page = 1
+
+    combine_continuation_tables(first, [continuation])
+
+    assert [[c.text for c in row] for row in first.rows] == [
+        ["Параметр", "Значение"],
+        ["Подача", "10"],
+        ["Напор", "20"],
+    ]
+    assert first.rows[2][0].row == 2
+    assert first.rows[2][0].page == 1
+    assert first.header_rows == 1
+    assert first.grid_rows == 3
 
 
 # --- apply_ops: операции (паритет с table-ops.js) -------------------------------
@@ -421,3 +456,228 @@ def test_api_apply_template():
         "document_id": doc["id"], "table_id": "nope", "template_id": mid}).status_code == 404
     assert client.post("/api/mapping/apply-template", json={
         "document_id": doc["id"], "table_id": table_id, "template_id": "nope"}).status_code == 404
+
+
+def _save_paged_mapping_doc(start_page: int) -> tuple[str, str, str]:
+    primary = _grid(
+        ["Параметр", "Значение"],
+        ["Подача", "10"],
+        header_rows=1,
+        page=start_page,
+    )
+    primary.id = f"p{start_page + 1}-t1"
+    decoy = _grid(["Примечание"], page=start_page + 1)
+    decoy.id = f"p{start_page + 2}-t1"
+    continuation = _grid(
+        ["Параметр", "Значение"],
+        ["Напор", "20"],
+        header_rows=1,
+        page=start_page + 1,
+    )
+    continuation.id = f"p{start_page + 2}-t2"
+
+    doc_id = storage.new_document_id()
+    storage.save_document_meta(doc_id, {
+        "id": doc_id,
+        "filename": "multipage.pdf",
+        "ext": ".pdf",
+        "fmt": "pdf",
+        "size_bytes": 0,
+        "pages": start_page + 2,
+        "ocr": False,
+        "status": "PARSED",
+        "tables": [primary.to_dict(), decoy.to_dict(), continuation.to_dict()],
+        "text_lines": [],
+        "loader": "pdf",
+    })
+    return doc_id, primary.id, continuation.id
+
+
+def test_api_mapping_uses_and_reapplies_multipage_continuations():
+    doc_id, table_id, continuation_id = _save_paged_mapping_doc(0)
+    annotations = [
+        {"row": 1, "col": 0, "role": "param"},
+        {"row": 1, "col": 1, "role": "value"},
+        {"row": 2, "col": 0, "role": "param"},
+        {"row": 2, "col": 1, "role": "value"},
+    ]
+
+    preview = client.post("/api/mapping/validate", json={
+        "document_id": doc_id,
+        "table_id": table_id,
+        "continuation_table_ids": [continuation_id],
+        "annotations": annotations,
+    })
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["stats"] == {"models": 0, "params": 2, "values": 2}
+
+    saved = client.post("/api/presets/save-from-mapping", json={
+        "name": f"Многостраничная {doc_id}",
+        "document_id": doc_id,
+        "table_id": table_id,
+        "continuation_table_ids": [continuation_id],
+        "annotations": annotations,
+    })
+    assert saved.status_code == 200, saved.text
+    template = saved.json()
+    assert template["continuations"] == [{
+        "page_offset": 1,
+        "table_index": 2,
+        "n_cols": 2,
+        "skip_header_rows": True,
+        "repeats_header": True,
+    }]
+
+    # Та же структура начинается с пятой страницы: ссылка шаблона остаётся
+    # относительной и находит вторую таблицу уже на шестой странице.
+    target_doc, target_table, target_continuation = _save_paged_mapping_doc(4)
+    applied = client.post("/api/mapping/apply-template", json={
+        "document_id": target_doc,
+        "table_id": target_table,
+        "template_id": template["id"],
+    })
+    assert applied.status_code == 200, applied.text
+    out = applied.json()
+    assert out["continuation_table_ids"] == [target_continuation]
+    assert (out["table"]["n_rows"], out["table"]["n_cols"]) == (3, 2)
+    assert [(a["row"], a["col"], a["role"]) for a in out["annotations"]] == [
+        (1, 0, "param"),
+        (1, 1, "value"),
+        (2, 0, "param"),
+        (2, 1, "value"),
+    ]
+
+
+# --- продолжения: повторная шапка и подтверждение (ревью многостраничности) ---
+
+
+def _save_doc_with_tables(tables: list[Table], pages: int) -> str:
+    doc_id = storage.new_document_id()
+    storage.save_document_meta(doc_id, {
+        "id": doc_id,
+        "filename": "multipage.pdf",
+        "ext": ".pdf",
+        "fmt": "pdf",
+        "size_bytes": 0,
+        "pages": pages,
+        "ocr": False,
+        "status": "PARSED",
+        "tables": [t.to_dict() for t in tables],
+        "text_lines": [],
+        "loader": "pdf",
+    })
+    return doc_id
+
+
+def _paged(tid: str, page: int, *rows: list[str], header_rows: int = 0) -> Table:
+    t = _grid(*rows, header_rows=header_rows, page=page)
+    t.id = tid
+    return t
+
+
+def _save_template_with_continuation(continuation_rows, *, header_rows: int = 1) -> dict:
+    primary = _paged("p1-t1", 0, ["Параметр", "Значение"], ["Подача", "10"], header_rows=1)
+    cont = _paged("p2-t1", 1, *continuation_rows, header_rows=header_rows)
+    doc_id = _save_doc_with_tables([primary, cont], pages=2)
+    saved = client.post("/api/presets/save-from-mapping", json={
+        "name": f"Продолжение {doc_id}",
+        "document_id": doc_id,
+        "table_id": primary.id,
+        "continuation_table_ids": [cont.id],
+        "annotations": [{"row": 1, "col": 0, "role": "param"}],
+    })
+    assert saved.status_code == 200, saved.text
+    return saved.json()
+
+
+def test_combine_keeps_textual_first_row_without_repeated_header():
+    primary = _grid(["Параметр", "Значение"], ["Подача", "10"], header_rows=1, page=0)
+    # детектор пометил строку раздела как шапку, но это не повтор шапки основной
+    cont = _grid(["Электрические характеристики", ""], ["Мощность", "5"], header_rows=1, page=1)
+    combined = combine_continuation_tables(primary, [cont])
+    assert [r[0].text for r in combined.rows] == [
+        "Параметр", "Подача", "Электрические характеристики", "Мощность",
+    ]
+
+
+def test_combine_skips_repeated_header_unless_disabled():
+    def make():
+        primary = _grid(["Параметр", "Значение"], ["Подача", "10"], header_rows=1, page=0)
+        cont = _grid(["параметр ", "Значение:"], ["Напор", "20"], header_rows=1, page=1)
+        return primary, cont
+
+    primary, cont = make()
+    assert repeated_header_rows(primary, cont) == 1
+    combined = combine_continuation_tables(primary, [cont])
+    assert [r[0].text for r in combined.rows] == ["Параметр", "Подача", "Напор"]
+
+    primary, cont = make()
+    combined = combine_continuation_tables(primary, [cont], skip_header_rows=[False])
+    assert [r[0].text for r in combined.rows] == ["Параметр", "Подача", "параметр ", "Напор"]
+
+
+def test_saved_ref_records_repeats_header():
+    tpl = _save_template_with_continuation([["Параметр", "Значение"], ["Напор", "20"]])
+    assert tpl["continuations"][0]["repeats_header"] is True
+    tpl = _save_template_with_continuation([["Напор", "20"]], header_rows=0)
+    assert tpl["continuations"][0]["repeats_header"] is False
+
+
+def test_apply_template_rejects_unrelated_table_on_next_page():
+    tpl = _save_template_with_continuation([["Параметр", "Значение"], ["Напор", "20"]])
+    # в целевом документе таблица умещается на одной странице, а дальше — чужая
+    primary = _paged("p1-t1", 0, ["Параметр", "Значение"], ["Подача", "10"], header_rows=1)
+    other = _paged("p2-t1", 1, ["Модель", "Цена"], ["A-1", "100"], header_rows=1)
+    doc_id = _save_doc_with_tables([primary, other], pages=2)
+    out = client.post("/api/mapping/apply-template", json={
+        "document_id": doc_id, "table_id": primary.id, "template_id": tpl["id"],
+    })
+    assert out.status_code == 200, out.text
+    body = out.json()
+    assert body["continuation_table_ids"] == []
+    assert body["table"]["n_rows"] == 2
+    assert body["warnings"] == ["Продолжение на стр. +1 не подтверждено — пропущено"]
+
+
+def test_apply_template_rejects_headerless_table_not_at_page_boundary():
+    tpl = _save_template_with_continuation([["Напор", "20"]], header_rows=0)
+    primary = _paged("p1-t1", 0, ["Параметр", "Значение"], ["Подача", "10"], header_rows=1)
+    note = _paged("p1-t2", 0, ["Примечание"])  # основная — не последняя на странице
+    tail = _paged("p2-t1", 1, ["Напор", "20"])
+    doc_id = _save_doc_with_tables([primary, note, tail], pages=2)
+    body = client.post("/api/mapping/apply-template", json={
+        "document_id": doc_id, "table_id": primary.id, "template_id": tpl["id"],
+    }).json()
+    assert body["continuation_table_ids"] == []
+    assert body["warnings"]
+
+    # та же пара на границе страниц — продолжение подтверждено
+    doc_id = _save_doc_with_tables([primary, tail], pages=2)
+    body = client.post("/api/mapping/apply-template", json={
+        "document_id": doc_id, "table_id": primary.id, "template_id": tpl["id"],
+    }).json()
+    assert body["continuation_table_ids"] == [tail.id]
+    assert body["warnings"] == []
+
+
+def test_table_index_counts_empty_tables_and_survives_shift():
+    primary = _paged("p1-t1", 0, ["Параметр", "Значение"], ["Подача", "10"], header_rows=1)
+    empty = Table(id="p2-t1", rows=[], page=1)  # без ячеек: в маппере не видна
+    cont = _paged("p2-t2", 1, ["Параметр", "Значение"], ["Напор", "20"], header_rows=1)
+    doc_id = _save_doc_with_tables([primary, empty, cont], pages=2)
+    saved = client.post("/api/presets/save-from-mapping", json={
+        "name": f"Индекс {doc_id}",
+        "document_id": doc_id,
+        "table_id": primary.id,
+        "continuation_table_ids": [cont.id],
+        "annotations": [{"row": 1, "col": 0, "role": "param"}],
+    }).json()
+    assert saved["continuations"][0]["table_index"] == 2
+
+    # в целевом документе пустой таблицы нет: индекс сдвинулся, повтор шапки находит фрагмент
+    doc2 = _save_doc_with_tables([primary, cont], pages=2)
+    body = client.post("/api/mapping/apply-template", json={
+        "document_id": doc2, "table_id": primary.id, "template_id": saved["id"],
+    }).json()
+    assert body["continuation_table_ids"] == [cont.id]
+    assert body["table"]["n_rows"] == 3

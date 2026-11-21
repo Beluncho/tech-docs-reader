@@ -1,7 +1,8 @@
 """Шаблоны маппинга из Visual Mapper: сигнатура таблицы, фингерпринт, подбор.
 
 Маппинг = аннотации ролей (в финальных координатах) + ops-рецепт структурных
-правок (merge/split/transpose/del_rows/del_cols из этапа 3.5). Шаблон
+правок (merge/split/transpose/del_rows/del_cols из этапа 3.5) + относительные
+ссылки на постраничные продолжения. Шаблон
 применим к таблицам с такой же структурой: сигнатура — число колонок и
 нормализованные тексты шапки (header_rows, иначе первая непустая строка).
 """
@@ -81,6 +82,7 @@ def template_from_mapping(
     source: dict[str, Any],
     ops: list[dict],
     annotations: list[dict],
+    continuations: list[dict] | None = None,
 ) -> dict:
     """Собрать шаблон маппинга (без id — его назначает storage)."""
     sig = table_signature(table)
@@ -92,6 +94,7 @@ def template_from_mapping(
         "source": source,
         "table_signature": sig,
         "table_fingerprint": compute_table_fingerprint(sig),
+        "continuations": continuations or [],
         "ops": ops,
         "annotations": annotations,
     }
